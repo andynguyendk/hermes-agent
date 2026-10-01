@@ -1526,3 +1526,32 @@ class TestAzureFoundryPickerCatalog:
         monkeypatch.setattr(_models_mod, "_get_model_config_dict",
                             lambda: {"provider": "azure-foundry", "base_url": "https://b.openai.azure.com/openai/v1"})
         assert _models_mod._credential_fingerprint("azure-foundry") != fp_a
+
+
+class TestCredentialFingerprintDotenvLoad:
+    """The provider-model disk cache is keyed by ``_credential_fingerprint``, so a process that never
+    loaded the dotenv must still produce the fingerprint a dotenv-loaded reader (the gateway)
+    produces: otherwise every row it stores is a cold cache for the reader, and ``/model`` silently
+    degrades to the provider plugin's stale ``fallback_models`` floor.
+    """
+
+    def test_fingerprint_hashes_the_dotenv_credentials_without_a_prior_startup_load(
+        self, tmp_path, monkeypatch
+    ):
+        import os
+
+        home = tmp_path / "hermes_home"
+        home.mkdir()
+        (home / ".env").write_text("COMMANDCODE_API_KEY=sk-only-in-dotenv\n")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.delenv("COMMANDCODE_API_KEY", raising=False)
+        monkeypatch.setattr(_models_mod, "_dotenv_loaded_for_fingerprint", False)
+
+        with patch.object(_models_mod, "_ensure_dotenv_loaded_for_fingerprint", lambda: None):
+            keyless = _models_mod._credential_fingerprint("commandcode")  # a process with no dotenv load
+
+        monkeypatch.setattr(_models_mod, "_dotenv_loaded_for_fingerprint", False)
+        from_dotenv = _models_mod._credential_fingerprint("commandcode")
+
+        assert os.environ.get("COMMANDCODE_API_KEY") == "sk-only-in-dotenv"
+        assert from_dotenv != keyless

@@ -1836,6 +1836,28 @@ def _provider_models_cache_path() -> Path:
     return get_hermes_home() / "provider_models_cache.json"
 
 
+_dotenv_loaded_for_fingerprint = False
+
+
+def _ensure_dotenv_loaded_for_fingerprint() -> None:
+    """Load ``$HERMES_HOME/.env`` once per process so credentials are in ``os.environ`` before hashing.
+
+    The provider-model cache is keyed by this fingerprint, so a process that skipped the startup
+    dotenv load (bare cron/script entry points) would write rows under a keyless fingerprint that
+    every dotenv-loaded reader — the gateway — treats as a cold cache, silently degrading ``/model``
+    to the provider plugin's stale ``fallback_models``. Repeat calls are a no-op; failure is not
+    fatal (a caller with no readable env keeps the old, env-only fingerprint)."""
+    global _dotenv_loaded_for_fingerprint
+    if _dotenv_loaded_for_fingerprint:
+        return
+    _dotenv_loaded_for_fingerprint = True
+    try:
+        from hermes_cli.env_loader import load_hermes_dotenv
+        load_hermes_dotenv()  # process home; skips itself under a multiplex profile scope
+    except Exception:
+        pass
+
+
 def _credential_fingerprint(provider: str) -> str:
     """Short hash of the credentials ``provider_model_ids(provider)`` would see right now.
 
@@ -1844,6 +1866,8 @@ def _credential_fingerprint(provider: str) -> str:
     not discard an account-scoped catalog, while a real account switch must invalidate it.
     """
     import hashlib
+
+    _ensure_dotenv_loaded_for_fingerprint()
 
     parts: list[str] = []
     try:
