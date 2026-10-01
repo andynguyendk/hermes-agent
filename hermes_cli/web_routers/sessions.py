@@ -381,6 +381,7 @@ async def search_sessions(
                         "output_tokens": row.get("output_tokens") or 0,
                         "preview": row.get("preview"),
                         "parent_session_id": row.get("parent_session_id"),
+                        "profile": _serving_profile(profile),
                         "archived": bool(row.get("archived"))})
                 else:
                     payload["id"] = sid
@@ -489,9 +490,10 @@ async def delete_empty_sessions_endpoint(profile: Optional[str] = None):
     Archived sessions are skipped — the user explicitly chose to keep those rows. * Children of deleted
     parents are orphaned, not cascade-deleted. See #95868.
     """
+    profile = destructive_profile(profile, "DELETE /api/sessions/empty")
     deleted = await asyncio.to_thread(
-        _with_db, destructive_profile(profile, "DELETE /api/sessions/empty"),
-        lambda db: db.delete_empty_sessions(), read_only=False)
+        _with_db, profile,
+        lambda db: db.delete_empty_sessions(sessions_dir=_session_files_dir(profile)), read_only=False)
     return {"ok": True, "deleted": deleted}
 
 
@@ -586,20 +588,40 @@ def _session_files_dir(profile) -> Path:
     return _history_profile_home(profile) / "sessions"
 
 
-def _project_for_display(messages: list, *, home=None) -> list:
+def _project_for_display(messages: list, *, home=None, inline_images: bool = True) -> list:
     from agent.compaction_display import project_compaction_message_for_display
     from agent.context_compressor import is_compaction_summary_message
+    from agent.conversation_compression import _extract_steer_text_from_message
     from agent.history_commentary import project_history_commentary
+    from agent.prompt_builder import STEER_DISPLAY_KIND
     from agent.turn_failure_copy import untyped_failed_turn_display_kind
+
+    # inline_images=False (#116511): render content through the gateway's ``_coerce_message_text``
+    # projection so a data-URI image part becomes ``[image]`` — the same branch session.resume's
+    # ``inline_images=false`` uses, kilobytes instead of re-transmitting every stored attachment.
+    coerce = None
+    if not inline_images:
+        from tui_gateway.session_history import _coerce_message_text
+
+        def coerce(message: dict) -> dict:
+            if message.get("content") is not None:
+                return {**message, "content": _coerce_message_text(message["content"], image_urls=False)}
+            return message
 
     projected_messages = []
     for message in messages:
         message = _with_tool_call_labels(message)
+        if coerce is not None:
+            message = coerce(message)
         # Same read-side typing as session.resume (tui_gateway/session_history.py).
         failed_turn = not message.get("display_kind") and untyped_failed_turn_display_kind(
             message.get("role"), message.get("content"))
         if failed_turn:
             message = {**message, "display_kind": failed_turn}
+        # Mid-turn steer: the user's own words, not the model-facing marker (same as session.resume).
+        if message.get("role") == "user" and message.get("display_kind") == STEER_DISPLAY_KIND and (
+                steer_text := _extract_steer_text_from_message(message)):
+            message = {**message, "display_content": steer_text}
         if not is_compaction_summary_message(message):
             projected_messages.append(message)
             continue
@@ -622,7 +644,7 @@ def _project_for_display(messages: list, *, home=None) -> list:
 async def get_session_messages(
     session_id: str, profile: Optional[str] = None, limit: Optional[int] = Query(None, ge=0),
     offset: int = Query(0, ge=0), order: Optional[str] = Query(None),
-    include_compacted: bool = Query(False)):
+    include_compacted: bool = Query(False), inline_images: bool = Query(True)):
     if order not in (None, "oldest", "latest"):
         raise HTTPException(status_code=400, detail="order must be one of: oldest, latest")
 
@@ -636,16 +658,23 @@ async def get_session_messages(
         default_page = limit is None
         latest_page = order == "latest" or (order is None and default_page)
         _limit = 500 if default_page else min(limit, 500)
+        # Include compression-ancestor messages so the REST transcript
+        # matches the gateway's session.resume (which uses
+        # include_ancestors=True). Without this, the desktop's REST
+        # prefetch only shows the child continuation's messages after a
+        # compression rotation, hiding the pre-compaction transcript
+        # (#51058).
         return sid, _limit, db.get_messages(
             sid, limit=_limit, offset=offset, latest=latest_page,
-            include_compacted=include_compacted)
+            include_compacted=include_compacted, include_ancestors=True)
 
     result = await asyncio.to_thread(_with_db, profile, _read, read_only=True)
     if result is None:
         raise HTTPException(status_code=404, detail=_NOT_FOUND)
     sid, _limit, messages = result
     projected_messages = await asyncio.to_thread(
-        _project_for_display, messages, home=_history_profile_home(profile))
+        _project_for_display, messages, home=_history_profile_home(profile),
+        inline_images=inline_images)
     return {
         "session_id": sid,
         # The same stamp list rows carry, so the Desktop keys a page under the
@@ -857,13 +886,3 @@ async def prune_sessions_endpoint(body: SessionPrune):
         body = body.model_copy(update={
             "profile": destructive_profile(body.profile, "POST /api/sessions/prune")})
     return await asyncio.to_thread(_prune_sessions, body)
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-from typing import Any  # noqa: F401,E402
-from typing import Dict  # noqa: F401,E402
-import logging  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----
