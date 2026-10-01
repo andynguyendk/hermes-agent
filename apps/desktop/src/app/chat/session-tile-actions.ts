@@ -634,11 +634,13 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
             const refreshed = await sessionTileDelegate()!.resumeTile(storedIdRef.current, {
               refreshTranscript: true
             })
+
             if (typeof refreshed === 'string' && refreshed && refreshed !== sessionId) {
               runtimeIdRef.current = refreshed
             }
 
             const freshMessages = readMessages()
+
             const retryPlan = planRestore(freshMessages, messageId, {
               text: target?.text ?? plan.sourceText,
               userOrdinal: target?.userOrdinal ?? plan.truncateOrdinal
@@ -741,8 +743,16 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
     [update]
   )
 
+  const branchInNewChat = useCallback(
+    (messageId: string) =>
+      sessionTileDelegate()?.branchSessionAtMessage(storedIdRef.current, runtimeIdRef.current, messageId) ??
+      Promise.resolve(false),
+    []
+  )
+
   return useMemo(
     () => ({
+      branchInNewChat,
       cancelRun,
       dismissError,
       editMessage,
@@ -754,6 +764,7 @@ export function useSessionTileActions({ requestGateway, runtimeId, scope, stored
       submitText
     }),
     [
+      branchInNewChat,
       cancelRun,
       dismissError,
       editMessage,
